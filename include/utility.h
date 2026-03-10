@@ -15,7 +15,7 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include <opencv/cv.h>
+#include <opencv2/opencv.hpp>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -51,10 +51,46 @@
 #include <limits>
 #include <iomanip>
 #include <array>
+#include <unordered_map>
 #include <thread>
 #include <mutex>
 
 using namespace std;
+
+namespace flann {
+namespace serialization {
+
+template<typename K, typename V>
+struct Serializer<std::unordered_map<K, V>>
+{
+    template<typename InputArchive>
+    static inline void load(InputArchive& ar, std::unordered_map<K, V>& map_val)
+    {
+        size_t size;
+        ar & size;
+        for (size_t i = 0; i < size; ++i)
+        {
+            K key;
+            ar & key;
+            V value;
+            ar & value;
+            map_val[key] = value;
+        }
+    }
+
+    template<typename OutputArchive>
+    static inline void save(OutputArchive& ar, const std::unordered_map<K, V>& map_val)
+    {
+        ar & map_val.size();
+        for (const auto& item : map_val) {
+            ar & item.first;
+            ar & item.second;
+        }
+    }
+};
+
+} // namespace serialization
+} // namespace flann
 
 typedef pcl::PointXYZI PointType;
 
