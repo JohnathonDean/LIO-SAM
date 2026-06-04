@@ -20,6 +20,8 @@ using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
 
+// 该类负责把“建图线程输出的激光里程计”与“IMU 高频增量里程计”做时间对齐和位姿拼接，
+// 对外发布连续、平滑的 odom->base_link 变换以及一条短时 IMU 轨迹。
 class TransformFusion : public ParamServer
 {
 public:
@@ -95,7 +97,13 @@ public:
 
         imuOdomQueue.push_back(*odomMsg);
 
-        // get latest odometry (at current IMU stamp)
+        // 以最近一次激光里程计为锚点，把 IMU 从该时刻到当前时刻的增量位姿补上，
+        // 从而得到“高频但被激光矫正过”的当前 odom。
+        //
+        // 这条 odom 之后会以 odomTopic 发布，同时 imageProjection 订阅的是
+        // odomTopic + "_incremental"。二者共同组成去畸变相关的里程计来源：
+        // 1. imageProjection 用它给当前扫描提供帧级初值；
+        // 2. 若启用平移 deskew，也会用这类连续增量估计整帧平移。
         if (lidarOdomTime == -1)
             return;
         while (!imuOdomQueue.empty())
@@ -153,6 +161,10 @@ public:
     }
 };
 
+// 该类是 IMU 预积分主节点：
+// 1. 订阅原始 IMU，高频积分得到实时增量里程计；
+// 2. 订阅 mapping 输出的低频激光校正结果；
+// 3. 用 GTSAM 因子图把 IMU 预积分、bias 漂移和激光位姿约束联合优化。
 class IMUPreintegration : public ParamServer
 {
 public:
@@ -173,9 +185,14 @@ public:
     gtsam::Vector noiseModelBetweenBias;
 
 
+    // 两套积分器分工不同：
+    // imuIntegratorOpt_ 只服务于“收到一帧激光校正后”的后端优化；
+    // imuIntegratorImu_ 负责在两次激光校正之间持续向前预测，实时发布高频里程计。
     gtsam::PreintegratedImuMeasurements *imuIntegratorOpt_;
     gtsam::PreintegratedImuMeasurements *imuIntegratorImu_;
 
+    // imuQueOpt: 给优化线程使用，保存两次激光校正之间需要被积分的 IMU；
+    // imuQueImu: 给前端实时预测使用，收到新 IMU 就继续往前推状态。
     std::deque<sensor_msgs::Imu> imuQueOpt;
     std::deque<sensor_msgs::Imu> imuQueImu;
 
@@ -199,9 +216,10 @@ public:
 
     int key = 1;
     
-    // T_bl: tramsform points from lidar frame to imu frame 
+    // 这里维护激光与 IMU 外参的双向变换。
+    // T_bl: lidar -> imu
     gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
-    // T_lb: tramsform points from imu frame to lidar frame
+    // T_lb: imu -> lidar
     gtsam::Pose3 lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
 
     IMUPreintegration()
@@ -253,6 +271,8 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
+        // mapping 线程输出的是低频、全局一致性更好的激光校正结果，
+        // 它在这里充当后端优化的“观测因子”。
         double currentCorrectionTime = ROS_TIME(odomMsg);
 
         // make sure we have imu data to integrate
@@ -270,7 +290,8 @@ public:
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
 
-        // 0. initialize system
+        // 0. 首次收到激光校正时初始化因子图：
+        // 用激光位姿初始化 X(0)，速度置零，bias 置零。
         if (systemInitialized == false)
         {
             resetOptimization();
@@ -316,7 +337,7 @@ public:
         }
 
 
-        // reset graph for speed
+        // 固定长度地重建图，避免因子图无限增长导致优化越来越慢。
         if (key == 100)
         {
             // get updated noise before reset
@@ -346,8 +367,8 @@ public:
             key = 1;
         }
 
-
-        // 1. integrate imu data and optimize
+        // 1. 把上一次校正到当前校正之间的 IMU 全部做预积分，
+        // 然后添加 IMU 因子、bias 因子和本次激光位姿因子，执行一次图优化。
         while (!imuQueOpt.empty())
         {
             // pop and integrate imu data that is between two optimizations
@@ -366,23 +387,23 @@ public:
             else
                 break;
         }
-        // add imu factor to graph
+        // IMU 因子描述“上一关键帧状态”到“当前关键帧状态”的运动约束。
         const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
         gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
         graphFactors.add(imu_factor);
-        // add imu bias between factor
+        // bias 因子约束相邻时刻 bias 变化不能过大，抑制漂移。
         graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
                          gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
-        // add pose factor
+        // 激光里程计提供当前位置观测。退化时放宽该观测噪声，避免错误强约束。
         gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
         gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose, degenerate ? correctionNoise2 : correctionNoise);
         graphFactors.add(pose_factor);
-        // insert predicted values
+        // 先用预积分预测作为初值，再交给 iSAM2 做增量优化。
         gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
         graphValues.insert(X(key), propState_.pose());
         graphValues.insert(V(key), propState_.v());
         graphValues.insert(B(key), prevBias_);
-        // optimize
+        // 增量优化后，最新的位姿/速度/bias 会成为下一轮预积分的起点。
         optimizer.update(graphFactors, graphValues);
         optimizer.update();
         graphFactors.resize(0);
@@ -403,7 +424,8 @@ public:
         }
 
 
-        // 2. after optiization, re-propagate imu odometry preintegration
+        // 2. 后端得到新的最优状态后，需要把前端实时积分器也重置到这个新状态，
+        // 再用“激光校正之后尚未消费的 IMU”重新推到当前时刻，保证实时 odom 不漂。
         prevStateOdom = prevState_;
         prevBiasOdom  = prevBias_;
         // first pop imu message older than current correction data
@@ -471,11 +493,11 @@ public:
         double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
         lastImuT_imu = imuTime;
 
-        // integrate this single imu message
+        // 前端高频线程每来一帧 IMU 就积分一次，实时预测当前 NavState。
         imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
                                                 gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
 
-        // predict odometry
+        // 预测得到的是 IMU 位姿，需要再通过外参转换回激光坐标系输出。
         gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
 
         // publish odometry
@@ -484,7 +506,7 @@ public:
         odometry.header.frame_id = odometryFrame;
         odometry.child_frame_id = "odom_imu";
 
-        // transform imu pose to ldiar
+        // LIO-SAM 的其他模块主要消费激光系位姿，所以这里把 IMU 预测结果变回 lidar pose。
         gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
         gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
 
@@ -509,6 +531,8 @@ public:
 
 int main(int argc, char** argv)
 {
+    // 该进程内部同时运行 IMUPreintegration 和 TransformFusion 两个模块，
+    // 前者负责 IMU 预积分与校正，后者负责把激光/IMU 里程计融合成最终 odom。
     ros::init(argc, argv, "roboat_loam");
     
     IMUPreintegration ImuP;

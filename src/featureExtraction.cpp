@@ -12,6 +12,8 @@ struct by_value{
     }
 };
 
+// 特征提取节点：
+// 从去畸变后的点云中筛选角点和面点，供后端 scan-to-map 配准使用。
 class FeatureExtraction : public ParamServer
 {
 
@@ -69,6 +71,7 @@ public:
         cloudHeader = msgIn->header; // new cloud header
         pcl::fromROSMsg(msgIn->cloud_deskewed, *extractedCloud); // new cloud for extraction
 
+        // 处理顺序：曲率估计 -> 遮挡剔除 -> 特征挑选 -> 发布。
         calculateSmoothness();
 
         markOccludedPoints();
@@ -80,6 +83,7 @@ public:
 
     void calculateSmoothness()
     {
+        // 用邻域距离变化近似曲率，曲率大更像边缘，曲率小更像平面。
         int cloudSize = extractedCloud->points.size();
         for (int i = 5; i < cloudSize - 5; i++)
         {
@@ -103,7 +107,7 @@ public:
     void markOccludedPoints()
     {
         int cloudSize = extractedCloud->points.size();
-        // mark occluded points and parallel beam points
+        // 标记遮挡点和不稳定点，避免它们进入特征集后破坏匹配质量。
         for (int i = 5; i < cloudSize - 6; ++i)
         {
             // occluded points
@@ -150,6 +154,7 @@ public:
         {
             surfaceCloudScan->clear();
 
+            // 每条扫描线再分 6 段选特征，保证特征空间分布更均匀。
             for (int j = 0; j < 6; j++)
             {
 
@@ -167,6 +172,7 @@ public:
                     int ind = cloudSmoothness[k].ind;
                     if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] > edgeThreshold)
                     {
+                        // 每段只保留少量最强边缘点，并屏蔽其相邻点避免过密。
                         largestPickedNum++;
                         if (largestPickedNum <= 20){
                             cloudLabel[ind] = 1;
@@ -198,6 +204,7 @@ public:
                     int ind = cloudSmoothness[k].ind;
                     if (cloudNeighborPicked[ind] == 0 && cloudCurvature[ind] < surfThreshold)
                     {
+                        // 平面点数量更多，后面还会做体素降采样以控制规模。
 
                         cloudLabel[ind] = -1;
                         cloudNeighborPicked[ind] = 1;
@@ -252,7 +259,7 @@ public:
         // save newly extracted features
         cloudInfo.cloud_corner  = publishCloud(pubCornerPoints,  cornerCloud,  cloudHeader.stamp, lidarFrame);
         cloudInfo.cloud_surface = publishCloud(pubSurfacePoints, surfaceCloud, cloudHeader.stamp, lidarFrame);
-        // publish to mapOptimization
+        // 发送给 mapOptimization 作为当前帧后端匹配输入。
         pubLaserCloudInfo.publish(cloudInfo);
     }
 };
